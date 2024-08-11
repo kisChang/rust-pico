@@ -38,11 +38,10 @@ bind_interrupts!(struct Irqs {
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
-const SERVER_IP: &str = "10.189.15.230";
-static SERVER_PORT: u16 = 1234;
-static SERVER_ADDR: Ipv4Address = Ipv4Address::from_str("10.189.15.230").unwrap();
+const SERVER_PORT: u16 = 1234;
+const SERVER_ADDR: &str = "10.189.15.230";
 
-static MY_CLIENT: i32 = 1;
+const MY_CLIENT: i32 = 1;
 static mut MY_GROUP: i32 = 1;
 
 // 初始化状态
@@ -134,7 +133,7 @@ async fn main(spawner: Spawner) {
 
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     info!("try connect...");
-    if let Err(e) = socket.connect((SERVER_ADDR, SERVER_PORT)).await {
+    if let Err(e) = socket.connect((Ipv4Address::from_str(SERVER_ADDR).unwrap(), SERVER_PORT)).await {
         warn!("connect error: {:?}", e);
         return;
     }
