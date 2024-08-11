@@ -9,6 +9,7 @@ use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::join::join;
+use embassy_futures::select::select;
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_net::dns::Socket;
 use embassy_net::tcp::TcpSocket;
@@ -19,8 +20,8 @@ use embassy_rp::gpio::{Input, Level, Output};
 use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::{ThreadModeRawMutex, NoopRawMutex};
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
@@ -38,8 +39,6 @@ bind_interrupts!(struct Irqs {
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
 
-
-type SocketType = Mutex<ThreadModeRawMutex, Option<TcpSocket<'static>>>;
 
 /////初始化状态
 static mut MY_CLIENT: i32 = 1;
@@ -132,8 +131,6 @@ async fn main(spawner: Spawner) {
     /////
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
-    let mut rx_buffer2 = [0; 512];
-    let mut tx_buffer2 = [0; 512];
 
 
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -143,7 +140,7 @@ async fn main(spawner: Spawner) {
         return;
     }
 
-    let socket_mutex: SocketType = Mutex::new(None);
+    let socket = Mutex::<NoopRawMutex, _>::from(socket);
 
     let key_control = async {
         let mut last_state = ping.is_low();
@@ -152,6 +149,7 @@ async fn main(spawner: Spawner) {
             if ping.is_low() == last_state {
                 continue;
             }
+            let mut socket = socket.lock().await;
             if ping.is_low() {
                 info!("low");
                 last_state = true;
@@ -167,7 +165,17 @@ async fn main(spawner: Spawner) {
     /** 收报代码 */
     let client_recv = async {
         let mut buf = [0; 4096];
+        let mut no_recv = false;
         loop {
+            if no_recv {
+                Timer::after(Duration::from_millis(1)).await;
+                no_recv = false;
+            }
+            let mut socket = socket.lock().await;
+            if !socket.can_recv() {
+                no_recv = true;
+                continue;
+            }
             match socket.read(&mut buf).await {
                 Ok(0) => {
                     warn!("read EOF");
@@ -177,29 +185,42 @@ async fn main(spawner: Spawner) {
                     if recv_len < 5 {
                         continue;
                     }
-                    let recv = &buf[..recv_len];
-                    if recv[0] != 0xFF {
-                        continue;
-                    }
-                    let command = recv[1];
-                    let body_length = ((recv[2] << 2) + recv[3]) as usize;
-                    let body = &recv[4..(4 + body_length)];
-                    match command {
-                        1 => unsafe { // 切换分组
-                            NOW_GROUP = body[0] as i32
+                    let mut offset = 0;
+                    while offset < recv_len {
+                        let chunk_len = (recv_len - offset).min(6);
+                        let packet = &buf[offset..offset + chunk_len];
+
+                        if chunk_len < 5 {
+                            break; //结束处理
                         }
-                        2 => { // 发报
-                            if body[0] == 0 {
-                                ding.set_low()
-                            } else {
-                                ding.set_high()
+
+                        // 处理固定长度的 packet
+                        if packet[0] != 0xFF {
+                            offset += 1; // 跳过1个字节
+                            continue;
+                        }
+                        let command = packet[1];
+                        let body_length = ((packet[2] << 2) + packet[3]) as usize;
+                        let body = &packet[4..(4 + body_length)];
+                        match command {
+                            1 => unsafe { // 切换分组
+                                NOW_GROUP = body[0] as i32
                             }
+                            2 => { // 发报
+                                if body[0] == 0 {
+                                    ding.set_low()
+                                } else {
+                                    ding.set_high()
+                                }
+                            }
+                            8 => unsafe { // 工作模式
+                                NOW_DING = body[0] == 1
+                            }
+                            9 => {} // Ping
+                            _ => {}
                         }
-                        8 => unsafe { // 工作模式
-                            NOW_DING = body[0] == 1
-                        }
-                        9 => {} // Ping
-                        _ => {}
+
+                        offset += chunk_len;
                     }
                 }
                 Err(e) => {
