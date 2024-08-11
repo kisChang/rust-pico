@@ -38,14 +38,16 @@ bind_interrupts!(struct Irqs {
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
+const SERVER_IP: &str = "10.189.15.230";
+static SERVER_PORT: u16 = 1234;
+static SERVER_ADDR: Ipv4Address = Ipv4Address::from_str("10.189.15.230").unwrap();
 
-
-/////初始化状态
-static mut MY_CLIENT: i32 = 1;
+static MY_CLIENT: i32 = 1;
 static mut MY_GROUP: i32 = 1;
+
+// 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
-/////
 
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
@@ -63,9 +65,6 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let server_port: u16 = 1234;
-    let server_addr: Ipv4Address = Ipv4Address::from_str("10.189.15.230").unwrap();
-
     let mut p = embassy_rp::init(Default::default());
     let mut rng = RoscRng;
     let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
@@ -135,7 +134,7 @@ async fn main(spawner: Spawner) {
 
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     info!("try connect...");
-    if let Err(e) = socket.connect((server_addr, server_port)).await {
+    if let Err(e) = socket.connect((SERVER_ADDR, SERVER_PORT)).await {
         warn!("connect error: {:?}", e);
         return;
     }
@@ -151,13 +150,11 @@ async fn main(spawner: Spawner) {
             }
             let mut socket = socket.lock().await;
             if ping.is_low() {
-                info!("low");
                 last_state = true;
-                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
-            } else {
-                info!("high");
-                last_state = false;
                 socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+            } else {
+                last_state = false;
+                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
             }
         }
     };
