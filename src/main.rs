@@ -7,7 +7,8 @@ use core::str::{from_utf8, FromStr};
 
 use cyw43_pio::PioSpi;
 use defmt::*;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
+use embassy_futures::join::join;
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_net::dns::Socket;
 use embassy_net::tcp::TcpSocket;
@@ -15,8 +16,11 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_rp::{bind_interrupts, Peripherals};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
+use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
@@ -34,12 +38,19 @@ bind_interrupts!(struct Irqs {
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
 
+
+type SocketType = Mutex<ThreadModeRawMutex, Option<TcpSocket<'static>>>;
+
 /////初始化状态
 static mut MY_CLIENT: i32 = 1;
 static mut MY_GROUP: i32 = 1;
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
 /////
+
+static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
+static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
@@ -53,8 +64,8 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let SERVER_PORT: u16 = 1234;
-    let SERVER_ADDR: Ipv4Address = Ipv4Address::from_str("10.189.15.230").unwrap();
+    let server_port: u16 = 1234;
+    let server_addr: Ipv4Address = Ipv4Address::from_str("10.189.15.230").unwrap();
 
     let mut p = embassy_rp::init(Default::default());
     let mut rng = RoscRng;
@@ -111,85 +122,100 @@ async fn main(spawner: Spawner) {
     let my_ip = stack.config_v4();
     info!("DHCP IP: {:?}", my_ip.unwrap().address);
 
+
     /////初始化控制器
     let mut ding = Output::new(p.PIN_17, Level::Low);
-    let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::None);
+    let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
+    // let g_up = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
+    // let g_down = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
+    // let g_reset = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
     /////
+    let mut rx_buffer = [0; 512];
+    let mut tx_buffer = [0; 512];
+    let mut rx_buffer2 = [0; 512];
+    let mut tx_buffer2 = [0; 512];
 
-    loop {
-        let mut rx_buffer = [0; 4096];
-        let mut tx_buffer = [0; 4096];
-        let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        info!("try connect...");
-        if let Err(e) = socket.connect((SERVER_ADDR, SERVER_PORT)).await {
-            warn!("connect error: {:?}", e);
-            continue;
-        }
 
-        unwrap!(spawner.spawn(key_control(&mut ping, socket.into())));
-        unwrap!(spawner.spawn(client_recv(socket.into(), &mut ding)));
+    let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    info!("try connect...");
+    if let Err(e) = socket.connect((server_addr, server_port)).await {
+        warn!("connect error: {:?}", e);
+        return;
     }
-}
 
-#[embassy_executor::task]
-async fn key_control(ping: &mut Input, mut socket: TcpSocket) {
-    // let g_up = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::None);
-    // let g_down = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::None);
-    // let g_reset = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::None);
+    let socket_mutex: SocketType = Mutex::new(None);
 
-    loop {
-        ping.wait_for_any_edge().await;
-        if ping.is_low() {
-            socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
-        }else {
-            socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
-        }
-    }
-}
-
-/** 收报代码 */
-#[embassy_executor::task]
-async fn client_recv(mut socket: TcpSocket, ding: &mut Output) {
-    let mut buf = [0; 4096];
-    loop {
-        match socket.read(&mut buf).await {
-            Ok(0) => {
-                warn!("read EOF");
-                break;
+    let key_control = async {
+        let mut last_state = ping.is_low();
+        loop {
+            ping.wait_for_any_edge().await;
+            if ping.is_low() == last_state {
+                continue;
             }
-            Ok(recvLen) => {
-                if recvLen < 5 {
-                    continue;
+            if ping.is_low() {
+                info!("low");
+                last_state = true;
+                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
+            } else {
+                info!("high");
+                last_state = false;
+                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+            }
+        }
+    };
+
+    /** 收报代码 */
+    let client_recv = async {
+        let mut buf = [0; 4096];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) => {
+                    warn!("read EOF");
+                    break;
                 }
-                let recv = &buf[..recvLen];
-                if recv[0] != 0xFF {
-                    continue;
-                }
-                let command = recv[1];
-                let body_length = ((recv[2] << 2) + recv[3]) as usize;
-                let body = &recv[4..(4 + body_length)];
-                match command {
-                    1 => unsafe { // 切换分组
-                        NOW_GROUP = body[0] as i32
+                Ok(recv_len) => {
+                    if recv_len < 5 {
+                        continue;
                     }
-                    2 => { // 发报
-                        if body[0] == 0 {
-                            ding.set_low()
-                        } else {
-                            ding.set_high()
+                    let recv = &buf[..recv_len];
+                    if recv[0] != 0xFF {
+                        continue;
+                    }
+                    let command = recv[1];
+                    let body_length = ((recv[2] << 2) + recv[3]) as usize;
+                    let body = &recv[4..(4 + body_length)];
+                    match command {
+                        1 => unsafe { // 切换分组
+                            NOW_GROUP = body[0] as i32
                         }
+                        2 => { // 发报
+                            if body[0] == 0 {
+                                ding.set_low()
+                            } else {
+                                ding.set_high()
+                            }
+                        }
+                        8 => unsafe { // 工作模式
+                            NOW_DING = body[0] == 1
+                        }
+                        9 => {} // Ping
+                        _ => {}
                     }
-                    8 => unsafe { // 工作模式
-                        NOW_DING = body[0] == 1
-                    }
-                    9 => {} // Ping
-                    _ => {}
                 }
-            }
-            Err(e) => {
-                warn!("read error: {:?}", e);
-                break;
-            }
-        };
-    }
+                Err(e) => {
+                    warn!("read error: {:?}", e);
+                    break;
+                }
+            };
+        }
+    };
+
+
+    // embassy_rp::multicore::spawn_core1(p.CORE1, unsafe { &mut CORE1_STACK }, move || {
+    //     let executor1 = EXECUTOR1.init(Executor::new());
+    //     executor1.run(|spawner| spawner.spawn(key_control(ping, &socket)).unwrap());
+    // });
+    // unwrap!(spawner.spawn(key_control));
+
+    join(key_control, client_recv).await;
 }
