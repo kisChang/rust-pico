@@ -2,26 +2,19 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use core::fmt::Debug;
-use core::str::{from_utf8, FromStr};
-
+use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
-use embassy_executor::{Executor, Spawner};
+use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_futures::select::select;
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
-use embassy_net::dns::Socket;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_rp::{bind_interrupts, Peripherals};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
 use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::blocking_mutex::raw::{ThreadModeRawMutex, NoopRawMutex};
-use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
@@ -47,10 +40,6 @@ static mut MY_GROUP: i32 = 1;
 // 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
-
-static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
-static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
-static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
@@ -121,7 +110,7 @@ async fn main(spawner: Spawner) {
 
 
     /////初始化控制器
-    let mut ding = Output::new(p.PIN_17, Level::Low);
+    let ding = Output::new(p.PIN_17, Level::Low);
     let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
     // let g_up = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
     // let g_down = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
@@ -137,9 +126,10 @@ async fn main(spawner: Spawner) {
         warn!("connect error: {:?}", e);
         return;
     }
+    // split reader\write
+    let (mut reader, mut writer) = socket.split();
 
-    let socket = Mutex::<NoopRawMutex, _>::from(socket);
-
+    // 控制器实现
     let key_control = async {
         let mut last_state = ping.is_low();
         loop {
@@ -147,92 +137,74 @@ async fn main(spawner: Spawner) {
             if ping.is_low() == last_state {
                 continue;
             }
-            let mut socket = socket.lock().await;
             if ping.is_low() {
                 last_state = true;
-                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+                writer.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
             } else {
                 last_state = false;
-                socket.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
+                writer.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
             }
         }
     };
 
-    /** 收报代码 */
-    let client_recv = async {
-        let mut buf = [0; 4096];
-        let mut no_recv = false;
-        loop {
-            if no_recv {
-                Timer::after(Duration::from_millis(1)).await;
-                no_recv = false;
+    join(key_control, client_recv(reader, ding)).await;
+}
+
+/** 收报代码 */
+async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
+    let mut buf = [0; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => {
+                warn!("read EOF");
+                break;
             }
-            let mut socket = socket.lock().await;
-            if !socket.can_recv() {
-                no_recv = true;
-                continue;
-            }
-            match socket.read(&mut buf).await {
-                Ok(0) => {
-                    warn!("read EOF");
-                    break;
+            Ok(recv_len) => {
+                if recv_len < 5 {
+                    continue;
                 }
-                Ok(recv_len) => {
-                    if recv_len < 5 {
+                let mut offset = 0;
+                while offset < recv_len {
+                    let chunk_len = (recv_len - offset).min(6);
+                    let packet = &buf[offset..offset + chunk_len];
+
+                    if chunk_len < 5 {
+                        break; //结束处理
+                    }
+
+                    // 处理固定长度的 packet
+                    if packet[0] != 0xFF {
+                        offset += 1; // 跳过1个字节
                         continue;
                     }
-                    let mut offset = 0;
-                    while offset < recv_len {
-                        let chunk_len = (recv_len - offset).min(6);
-                        let packet = &buf[offset..offset + chunk_len];
-
-                        if chunk_len < 5 {
-                            break; //结束处理
+                    let command = packet[1];
+                    let body_length = ((packet[2] << 2) + packet[3]) as usize;
+                    let body = &packet[4..(4 + body_length)];
+                    match command {
+                        1 => unsafe { // 切换分组
+                            NOW_GROUP = body[0] as i32
                         }
-
-                        // 处理固定长度的 packet
-                        if packet[0] != 0xFF {
-                            offset += 1; // 跳过1个字节
-                            continue;
+                        2 => { // 发报
+                            if body[0] == 0 {
+                                ding.set_low()
+                            } else {
+                                ding.set_high()
+                            }
                         }
-                        let command = packet[1];
-                        let body_length = ((packet[2] << 2) + packet[3]) as usize;
-                        let body = &packet[4..(4 + body_length)];
-                        match command {
-                            1 => unsafe { // 切换分组
-                                NOW_GROUP = body[0] as i32
-                            }
-                            2 => { // 发报
-                                if body[0] == 0 {
-                                    ding.set_low()
-                                } else {
-                                    ding.set_high()
-                                }
-                            }
-                            8 => unsafe { // 工作模式
-                                NOW_DING = body[0] == 1
-                            }
-                            9 => {} // Ping
-                            _ => {}
+                        8 => unsafe { // 工作模式
+                            NOW_DING = body[0] == 1
                         }
-
-                        offset += chunk_len;
+                        9 => {} // Ping
+                        _ => {}
                     }
+
+                    offset += chunk_len;
                 }
-                Err(e) => {
-                    warn!("read error: {:?}", e);
-                    break;
-                }
-            };
-        }
-    };
-
-
-    // embassy_rp::multicore::spawn_core1(p.CORE1, unsafe { &mut CORE1_STACK }, move || {
-    //     let executor1 = EXECUTOR1.init(Executor::new());
-    //     executor1.run(|spawner| spawner.spawn(key_control(ping, &socket)).unwrap());
-    // });
-    // unwrap!(spawner.spawn(key_control));
-
-    join(key_control, client_recv).await;
+            }
+            Err(e) => {
+                warn!("read error: {:?}", e);
+                break;
+            }
+        };
+    }
 }
