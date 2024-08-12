@@ -7,6 +7,7 @@ use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
+use embassy_futures::select::select;
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_rp::{bind_interrupts, Peripherals};
@@ -112,14 +113,13 @@ async fn main(spawner: Spawner) {
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
     let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
-    // let g_up = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
-    // let g_down = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
-    // let g_reset = Input::new(&p.PIN_16, embassy_rp::gpio::Pull::Down);
+    let mut g_up = Input::new(p.PIN_14, embassy_rp::gpio::Pull::Up);
+    let mut g_down = Input::new(p.PIN_15, embassy_rp::gpio::Pull::Up);
+    let mut g_reset = Input::new(p.PIN_13, embassy_rp::gpio::Pull::Up);
+
     /////
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
-
-
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     info!("try connect...");
     if let Err(e) = socket.connect((Ipv4Address::from_str(SERVER_ADDR).unwrap(), SERVER_PORT)).await {
@@ -134,6 +134,7 @@ async fn main(spawner: Spawner) {
         let mut last_state = ping.is_low();
         loop {
             ping.wait_for_any_edge().await;
+            Timer::after(Duration::from_millis(50)).await; // 等待防抖动延迟
             if ping.is_low() == last_state {
                 continue;
             }
@@ -152,7 +153,7 @@ async fn main(spawner: Spawner) {
 
 /** 收报代码 */
 async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
-    let mut buf = [0; 4096];
+    let mut buf = [0; 256];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
