@@ -16,8 +16,10 @@ const TABLE: [u8; 26] = [
 ];
 
 fn buf_7seg_c(temp: char, has_dot: bool) -> u8 {
-    let index = "0123456789AbCdEFHLNUPo-&@$".find(temp).unwrap_or(0);
-    let mut buf = TABLE[index];
+    let mut buf: u8 = match "0123456789AbCdEFHLNUPo-&@$".find(temp) {
+        None => 0,
+        Some(index) => TABLE[index],
+    };
     buf = !buf;
     if has_dot {
         buf &= 0x7f;

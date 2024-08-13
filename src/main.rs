@@ -7,7 +7,7 @@ use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::{join3, join4};
 use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
@@ -17,7 +17,8 @@ use embassy_rp::gpio::{Input, Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::watchdog::Watchdog;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::channel::{Channel, Sender};
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
@@ -44,7 +45,7 @@ static mut MY_GROUP: i32 = 1;
 // 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
-static mut LED: Option<Led> = None;
+static LED_CHANNEL: Channel<ThreadModeRawMutex, &str, 64> = Channel::new();
 
 #[embassy_executor::task]
 async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
@@ -89,10 +90,9 @@ async fn main(spawner: Spawner) {
     let dio = Output::new(p.PIN_11, Level::Low);    //数据引脚 SDI
     let rclk = Output::new(p.PIN_12, Level::Low);   //时钟引脚 SCLK
     let sclk = Output::new(p.PIN_13, Level::Low);   //锁存引脚 LOAD
-    unsafe { LED = Some(Led { data_pin: dio, clock_pin: rclk, latch_pin: sclk }); } // 初始化LED
+    let mut led = Led { data_pin: dio, clock_pin: rclk, latch_pin: sclk }; // 初始化LED
 
-
-    unsafe { LED.as_mut().unwrap().show("0.0.0.0").await; } //启动中
+    led.show("0.0.0.0").await; //启动中
     //// 初始化网络
     let mut rng = RoscRng;
     let fw = get_firmware();
@@ -131,7 +131,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(net_task(stack)));
 
     control.gpio_set(0, true).await;
-    unsafe { LED.as_mut().unwrap().show(" . . .0").await; } //连接WiFi
+    led.show(" . . .0").await; //连接WiFi
     loop {
         //control.join_open(WIFI_NETWORK).await;
         match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
@@ -142,7 +142,7 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    unsafe { LED.as_mut().unwrap().show(" . .0.8").await; } //获取IP
+    led.show(" . .0.8").await; //获取IP
     // Wait for DHCP, not necessary when using static IP
     info!("waiting for DHCP...");
     while !stack.is_config_up() {
@@ -152,7 +152,7 @@ async fn main(spawner: Spawner) {
     info!("DHCP IP: {:?}", my_ip.unwrap().address);
 
 
-    unsafe { LED.as_mut().unwrap().show(" .0.8.8").await; } //尝试接入
+    led.show(" .0.8.8").await; //尝试接入
     /////
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
@@ -178,7 +178,7 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    unsafe { LED.as_mut().unwrap().show("8.8.8.8").await; } //启动完成
+    led.show("8.8.8.8").await; //启动完成
 
     let mut watchdog = Watchdog::new(p.WATCHDOG);
     watchdog.start(Duration::from_millis(8_300));
@@ -238,8 +238,7 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    unsafe { shuffle_led().await; }
-    join3(key_control, ping_timeout, client_recv(reader, ding, watchdog)).await;
+    join4(key_control, ping_timeout, shuffle_led(led), client_recv(reader, ding, watchdog, LED_CHANNEL.sender())).await;
 }
 
 async fn key_button(ping: &mut Input<'_>) -> bool {
@@ -260,7 +259,12 @@ async fn key_button(ping: &mut Input<'_>) -> bool {
 }
 
 /** 收报代码 */
-async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchdog: Watchdog) {
+async fn client_recv(
+    mut reader: TcpReader<'_>,
+    mut ding: Output<'_>,
+    mut watchdog: Watchdog,
+    sender: Sender<'_, ThreadModeRawMutex, &str, 64>
+) {
     let mut buf = [0; 256];
     loop {
         match reader.read(&mut buf).await {
@@ -295,7 +299,7 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchd
                     match command {
                         1 => unsafe { // 切换分组
                             NOW_GROUP = body[0] as i32;
-                            shuffle_led().await;
+                            sender.send("").await;
                         }
                         2 => unsafe { // 发报
                             if NOW_DING {
@@ -308,7 +312,7 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchd
                         }
                         8 => unsafe { // 工作模式
                             NOW_DING = body[0] == 1;
-                            shuffle_led().await;
+                            sender.send("").await;
                         }
                         9 => {}
                         _ => {}
@@ -326,17 +330,25 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchd
     }
 }
 
-async unsafe fn shuffle_led() {
-    if NOW_GROUP == 0 {
-        LED.as_mut().unwrap().show("LoAd").await;
-    } else {
-        let mut str: String<5> = String::try_from(NOW_GROUP).unwrap();
-        if MY_GROUP == NOW_GROUP {
-            str.push_str(" @").unwrap();
-        } else {
-            str.push_str(" $").unwrap();
+async fn shuffle_led(mut led: Led) {
+    loop {
+        match LED_CHANNEL.receive().await {
+            _ => unsafe {
+                if NOW_GROUP == 0 {
+                    led.show("LoAd").await;
+                } else {
+                    let mut str: String<5> = String::try_from(NOW_GROUP).unwrap();
+                    if MY_GROUP == NOW_GROUP {
+                        str.push_str(" @").unwrap();
+                    } else {
+                        str.push_str(" $").unwrap();
+                    }
+                    info!("show: {}", str);
+                    led.show(&str).await;
+                }
+                // info!("show: {}", str);
+                // led.show(str).await;
+            }
         }
-        info!("show: {}", str);
-        LED.as_mut().unwrap().show(&str).await;
     }
 }
