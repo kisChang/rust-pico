@@ -6,7 +6,7 @@ use crate::led::Led;
 use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_futures::join::{join3, join4};
 use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::{TcpReader, TcpSocket};
@@ -14,6 +14,7 @@ use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
+use embassy_rp::multicore::spawn_core1;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::watchdog::Watchdog;
@@ -46,6 +47,9 @@ static mut MY_GROUP: i32 = 1;
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
 static LED_CHANNEL: Channel<ThreadModeRawMutex, &str, 64> = Channel::new();
+
+static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
@@ -205,14 +209,20 @@ async fn main(spawner: Spawner) {
                 Either4::Second(state) => unsafe {
                     if state {
                         let mut w = writer.lock().await;
-                        let tg = (NOW_GROUP + 1) as u8;
+                        let mut tg = (NOW_GROUP + 1) as u8;
+                        if tg >= 99 {
+                            tg = 1
+                        }
                         w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
                     }
                 }
                 Either4::Third(state) => unsafe {
                     if state {
                         let mut w = writer.lock().await;
-                        let tg = (NOW_GROUP - 1) as u8;
+                        let mut tg = (NOW_GROUP - 1) as u8;
+                        if tg <= 0 {
+                            tg = 99
+                        }
                         w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
                     }
                 }
@@ -238,7 +248,16 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    join4(key_control, ping_timeout, shuffle_led(led), client_recv(reader, ding, watchdog, LED_CHANNEL.sender())).await;
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| unwrap!(spawner.spawn(shuffle_led(led))));
+        },
+    );
+
+    join3(key_control, ping_timeout, client_recv(reader, ding, watchdog, LED_CHANNEL.sender())).await;
 }
 
 async fn key_button(ping: &mut Input<'_>) -> bool {
@@ -330,6 +349,7 @@ async fn client_recv(
     }
 }
 
+#[embassy_executor::task]
 async fn shuffle_led(mut led: Led) {
     loop {
         match LED_CHANNEL.receive().await {
