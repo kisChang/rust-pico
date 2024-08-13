@@ -1,18 +1,17 @@
 #![no_std]
 #![no_main]
 #![allow(async_fn_in_trait)]
-
 mod led;
-
+use crate::led::Led;
 use core::any::Any;
 use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::join::{join3};
+use embassy_futures::join::join3;
 use embassy_futures::select::{select4, Either4};
-use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_net::tcp::{TcpReader, TcpSocket};
+use embassy_net::{Config, Ipv4Address, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
@@ -24,9 +23,9 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
+use heapless::{String, Vec};
 use rand::RngCore;
 use static_cell::StaticCell;
-use crate::led::Led;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -75,8 +74,8 @@ async fn main(spawner: Spawner) {
     let rclk = Output::new(p.PIN_12, Level::Low);   //时钟引脚 SCLK
     let sclk = Output::new(p.PIN_13, Level::Low);   //锁存引脚 LOAD
     unsafe { LED = Some(Led { data_pin: dio, clock_pin: rclk, latch_pin: sclk }); } // 初始化LED
-    
-    
+
+
     unsafe { LED.as_mut().unwrap().show("0.0.0.0").await; } //启动中
     //// 初始化网络
     let mut rng = RoscRng;
@@ -304,6 +303,16 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchd
     }
 }
 
-async unsafe fn shuffle_led()  {
-    LED.as_mut().unwrap().show("8.8.8.8").await;
+async unsafe fn shuffle_led() {
+    if NOW_GROUP == 0 {
+        LED.as_mut().unwrap().show("LoAd").await;
+    } else {
+        let mut str: String<10> = String::try_from(NOW_GROUP).unwrap();
+        if MY_GROUP == NOW_GROUP {
+            str.push_str(" @").unwrap();
+        } else {
+            str.push_str(" $").unwrap();
+        }
+        LED.as_mut().unwrap().show(&str).await;
+    }
 }
