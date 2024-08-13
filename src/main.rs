@@ -3,7 +3,6 @@
 #![allow(async_fn_in_trait)]
 mod led;
 use crate::led::Led;
-use core::any::Any;
 use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
@@ -21,9 +20,8 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
-use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
-use heapless::{String, Vec};
+use heapless::String;
 use rand::RngCore;
 use static_cell::StaticCell;
 
@@ -58,6 +56,24 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
 
+#[cfg(debug_assertions)]
+fn get_firmware() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) }
+}
+#[cfg(debug_assertions)]
+fn get_firmware_clm() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) }
+}
+
+#[cfg(not(debug_assertions))]
+fn get_firmware() -> &'static [u8] {
+    include_bytes!("../src/lib/cyw43-firmware/43439A0.bin")
+}
+#[cfg(not(debug_assertions))]
+fn get_firmware_clm() -> &'static [u8] {
+    include_bytes!("../src/lib/cyw43-firmware/43439A0_clm.bin")
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -65,7 +81,7 @@ async fn main(spawner: Spawner) {
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
     // controller
-    let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
+    let mut ping = Input::new(p.PIN_14, embassy_rp::gpio::Pull::Up);
     let mut g_up = Input::new(p.PIN_18, embassy_rp::gpio::Pull::Up);
     let mut g_down = Input::new(p.PIN_19, embassy_rp::gpio::Pull::Up);
     let mut g_reset = Input::new(p.PIN_20, embassy_rp::gpio::Pull::Up);
@@ -79,8 +95,8 @@ async fn main(spawner: Spawner) {
     unsafe { LED.as_mut().unwrap().show("0.0.0.0").await; } //启动中
     //// 初始化网络
     let mut rng = RoscRng;
-    let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
-    let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
+    let fw = get_firmware();
+    let clm = get_firmware_clm();
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -147,7 +163,7 @@ async fn main(spawner: Spawner) {
             Err(e) => {
                 warn!("connect error: {:?}", e);
                 err_count += 1;
-                if (err_count < 30) {
+                if err_count < 30 {
                     warn!("wait time reconnect");
                     Timer::after(Duration::from_secs(10)).await;
                 } else {
@@ -167,8 +183,10 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_millis(8_300));
 
     // split reader\write
-    let (reader, writer_source) = socket.split();
+    let (reader, mut writer_source) = socket.split();
 
+    // init join client
+    writer_source.write_all(&[0xFF, 0x00, 0x00, 0x01, MY_CLIENT as u8, 0x00]).await.expect("send fail");
     let writer = Mutex::<NoopRawMutex, _>::from(writer_source);
 
     // 控制器实现
@@ -193,7 +211,7 @@ async fn main(spawner: Spawner) {
                 Either4::Third(state) => unsafe {
                     if state {
                         let mut w = writer.lock().await;
-                        let tg = (NOW_GROUP + 1) as u8;
+                        let tg = (NOW_GROUP - 1) as u8;
                         w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
                     }
                 }
@@ -307,7 +325,7 @@ async unsafe fn shuffle_led() {
     if NOW_GROUP == 0 {
         LED.as_mut().unwrap().show("LoAd").await;
     } else {
-        let mut str: String<10> = String::try_from(NOW_GROUP).unwrap();
+        let mut str: String<5> = String::try_from(NOW_GROUP).unwrap();
         if MY_GROUP == NOW_GROUP {
             str.push_str(" @").unwrap();
         } else {
