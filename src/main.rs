@@ -7,7 +7,7 @@ use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::join::{join3, join4};
+use embassy_futures::join::join3;
 use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
@@ -36,13 +36,13 @@ bind_interrupts!(struct Irqs {
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
-const SERVER_PORT: u16 = 10080;
-// const SERVER_ADDR: &str = "10.189.0.11";
 const SERVER_ADDR: &str = "10.189.15.230";
-
+// const SERVER_ADDR: &str = "10.189.0.11";
 const MY_CLIENT: i32 = 1;
-static mut MY_GROUP: i32 = 1;
 
+////// 固定算出的常量
+static mut MY_GROUP: i32 = (MY_CLIENT + 1) / 2;
+const SERVER_PORT: u16 = 10080;
 // 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
