@@ -1,12 +1,9 @@
-#![no_std]
-#![no_main]
-
 use embassy_rp::gpio::{Level, Output};
 use embassy_time::{Duration, Timer};
 use heapless::String;
 
 const MSBFIRST: bool = true;  // High bit first
-const LSBFIRST: bool = false; // Low bit first
+// const LSBFIRST: bool = false; // Low bit first
 
 // 7-segment display encoding
 const TABLE: [u8; 26] = [

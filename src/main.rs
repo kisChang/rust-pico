@@ -7,24 +7,23 @@ use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
-use embassy_futures::select::select;
+use embassy_futures::join::{join3};
+use embassy_futures::select::{select4, Either4};
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
-use embassy_net::tcp::{ConnectError, TcpReader, TcpSocket};
-use embassy_rp::{bind_interrupts, Peripherals};
+use embassy_net::tcp::{TcpReader, TcpSocket};
+use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
-use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::watchdog::Watchdog;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
 use rand::RngCore;
 use static_cell::StaticCell;
-use trouble_host::Address;
-use heapless::spsc::Queue;
 use crate::led::Led;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -36,7 +35,8 @@ bind_interrupts!(struct Irqs {
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
-const SERVER_PORT: u16 = 1234;
+const SERVER_PORT: u16 = 10080;
+// const SERVER_ADDR: &str = "10.189.0.11";
 const SERVER_ADDR: &str = "10.189.15.230";
 
 const MY_CLIENT: i32 = 1;
@@ -58,7 +58,7 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let mut p = embassy_rp::init(Default::default());
+    let p = embassy_rp::init(Default::default());
     let mut rng = RoscRng;
     let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
     let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
@@ -116,15 +116,15 @@ async fn main(spawner: Spawner) {
 
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
-    /// controller
+    // controller
     let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
     let mut g_up = Input::new(p.PIN_18, embassy_rp::gpio::Pull::Up);
     let mut g_down = Input::new(p.PIN_19, embassy_rp::gpio::Pull::Up);
     let mut g_reset = Input::new(p.PIN_20, embassy_rp::gpio::Pull::Up);
-    /// led
-    let mut dio = Output::new(p.PIN_11, Level::Low);    //数据引脚 SDI
-    let mut rclk = Output::new(p.PIN_12, Level::Low);   //时钟引脚 SCLK
-    let mut sclk = Output::new(p.PIN_13, Level::Low);   //锁存引脚 LOAD
+    // led
+    let dio = Output::new(p.PIN_11, Level::Low);    //数据引脚 SDI
+    let rclk = Output::new(p.PIN_12, Level::Low);   //时钟引脚 SCLK
+    let sclk = Output::new(p.PIN_13, Level::Low);   //锁存引脚 LOAD
     let mut led = Led { data_pin: dio, clock_pin: rclk, latch_pin: sclk }; // 初始化
 
     led.show("123.5").await;
@@ -158,28 +158,73 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_millis(8_300));
 
     // split reader\write
-    let (mut reader, mut writer) = socket.split();
+    let (reader, writer_source) = socket.split();
+
+    let writer = Mutex::<NoopRawMutex, _>::from(writer_source);
 
     // 控制器实现
     let key_control = async {
-        let mut last_state = ping.is_low();
         loop {
-            ping.wait_for_any_edge().await;
-            Timer::after(Duration::from_millis(50)).await; // 等待防抖动延迟
-            if ping.is_low() == last_state {
-                continue;
-            }
-            if ping.is_low() {
-                last_state = true;
-                writer.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
-            } else {
-                last_state = false;
-                writer.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
-            }
+            match select4(key_button(&mut ping), key_button(&mut g_up), key_button(&mut g_down), key_button(&mut g_reset)).await {
+                Either4::First(state) => {
+                    let mut w = writer.lock().await;
+                    if state {
+                        w.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+                    } else {
+                        w.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
+                    }
+                }
+                Either4::Second(state) => unsafe {
+                    if state {
+                        let mut w = writer.lock().await;
+                        let tg = (NOW_GROUP + 1) as u8;
+                        w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
+                    }
+                }
+                Either4::Third(state) => unsafe {
+                    if state {
+                        let mut w = writer.lock().await;
+                        let tg = (NOW_GROUP + 1) as u8;
+                        w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
+                    }
+                }
+                Either4::Fourth(state) => unsafe {
+                    if state {
+                        let mut w = writer.lock().await;
+                        let tg = MY_GROUP as u8;
+                        w.write_all(&[0xFF, 0x01, 0x00, 0x01, tg, 0x00]).await.expect("send fail");
+                    }
+                }
+            };
         }
     };
 
-    join(key_control, client_recv(reader, ding, watchdog)).await;
+    let ping_timeout = async {
+        loop {
+            Timer::after(Duration::from_millis(5_000)).await;
+            let mut w = writer.lock().await;
+            w.write_all(&[0xFF, 0x09, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+        }
+    };
+
+    join3(key_control, ping_timeout, client_recv(reader, ding, watchdog)).await;
+}
+
+async fn key_button(ping: &mut Input<'_>) -> bool {
+    let mut last_state = ping.is_low();
+    loop {
+        ping.wait_for_any_edge().await;
+        Timer::after(Duration::from_millis(50)).await; // 等待防抖动延迟
+        if ping.is_low() == last_state {
+            continue;
+        }
+        if ping.is_low() {
+            last_state = true;
+        } else {
+            last_state = false;
+        }
+        return last_state;
+    }
 }
 
 /** 收报代码 */
@@ -231,12 +276,8 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchd
                         8 => unsafe { // 工作模式
                             NOW_DING = body[0] == 1
                         }
-                        9 => { // Ping
-
-                        }
-                        _ => {
-
-                        }
+                        9 => {}
+                        _ => {}
                     }
 
                     offset += chunk_len;
