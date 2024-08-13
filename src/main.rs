@@ -2,6 +2,7 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
+mod led;
 use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
@@ -9,19 +10,22 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_futures::select::select;
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
-use embassy_net::tcp::{TcpReader, TcpSocket};
+use embassy_net::tcp::{ConnectError, TcpReader, TcpSocket};
 use embassy_rp::{bind_interrupts, Peripherals};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
 use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::Write;
 use rand::RngCore;
 use static_cell::StaticCell;
 use trouble_host::Address;
+use heapless::spsc::Queue;
+use crate::led::Led;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -112,20 +116,47 @@ async fn main(spawner: Spawner) {
 
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
+    /// controller
     let mut ping = Input::new(p.PIN_16, embassy_rp::gpio::Pull::Up);
-    let mut g_up = Input::new(p.PIN_14, embassy_rp::gpio::Pull::Up);
-    let mut g_down = Input::new(p.PIN_15, embassy_rp::gpio::Pull::Up);
-    let mut g_reset = Input::new(p.PIN_13, embassy_rp::gpio::Pull::Up);
+    let mut g_up = Input::new(p.PIN_18, embassy_rp::gpio::Pull::Up);
+    let mut g_down = Input::new(p.PIN_19, embassy_rp::gpio::Pull::Up);
+    let mut g_reset = Input::new(p.PIN_20, embassy_rp::gpio::Pull::Up);
+    /// led
+    let mut dio = Output::new(p.PIN_11, Level::Low);    //数据引脚 SDI
+    let mut rclk = Output::new(p.PIN_12, Level::Low);   //时钟引脚 SCLK
+    let mut sclk = Output::new(p.PIN_13, Level::Low);   //锁存引脚 LOAD
+    let mut led = Led { data_pin: dio, clock_pin: rclk, latch_pin: sclk }; // 初始化
+
+    led.show("123.5").await;
 
     /////
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     info!("try connect...");
-    if let Err(e) = socket.connect((Ipv4Address::from_str(SERVER_ADDR).unwrap(), SERVER_PORT)).await {
-        warn!("connect error: {:?}", e);
-        return;
+    loop {
+        let mut err_count = 0;
+        match socket.connect((Ipv4Address::from_str(SERVER_ADDR).unwrap(), SERVER_PORT)).await {
+            Err(e) => {
+                warn!("connect error: {:?}", e);
+                err_count += 1;
+                if (err_count < 30) {
+                    warn!("wait time reconnect");
+                    Timer::after(Duration::from_secs(10)).await;
+                } else {
+                    //reset to reboot
+                    cortex_m::peripheral::SCB::sys_reset();
+                }
+            }
+            Ok(_) => {
+                break;
+            }
+        }
     }
+
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.start(Duration::from_millis(8_300));
+
     // split reader\write
     let (mut reader, mut writer) = socket.split();
 
@@ -148,11 +179,11 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    join(key_control, client_recv(reader, ding)).await;
+    join(key_control, client_recv(reader, ding, watchdog)).await;
 }
 
 /** 收报代码 */
-async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
+async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>, mut watchdog: Watchdog) {
     let mut buf = [0; 256];
     loop {
         match reader.read(&mut buf).await {
@@ -161,6 +192,9 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
                 break;
             }
             Ok(recv_len) => {
+                // 收到过消息就feed watchdog
+                watchdog.feed();
+                // 处理消息
                 if recv_len < 5 {
                     continue;
                 }
@@ -185,18 +219,24 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
                         1 => unsafe { // 切换分组
                             NOW_GROUP = body[0] as i32
                         }
-                        2 => { // 发报
-                            if body[0] == 0 {
-                                ding.set_low()
-                            } else {
-                                ding.set_high()
+                        2 => unsafe { // 发报
+                            if NOW_DING {
+                                if body[0] == 0 {
+                                    ding.set_low()
+                                } else {
+                                    ding.set_high()
+                                }
                             }
                         }
                         8 => unsafe { // 工作模式
                             NOW_DING = body[0] == 1
                         }
-                        9 => {} // Ping
-                        _ => {}
+                        9 => { // Ping
+
+                        }
+                        _ => {
+
+                        }
                     }
 
                     offset += chunk_len;
@@ -204,6 +244,7 @@ async fn client_recv(mut reader: TcpReader<'_>, mut ding: Output<'_>) {
             }
             Err(e) => {
                 warn!("read error: {:?}", e);
+                // 这里可能要重启，由于break了不再接收，一会watchdog会重启
                 break;
             }
         };
