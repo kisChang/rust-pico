@@ -130,6 +130,7 @@ async fn main(spawner: Spawner) {
 
     unwrap!(spawner.spawn(net_task(stack)));
 
+    control.gpio_set(0, true).await;
     unsafe { LED.as_mut().unwrap().show(" . . .0").await; } //连接WiFi
     loop {
         //control.join_open(WIFI_NETWORK).await;
@@ -227,13 +228,17 @@ async fn main(spawner: Spawner) {
     };
 
     let ping_timeout = async {
+        let mut state = false;
         loop {
+            control.gpio_set(0, state).await;
+            state = !state;
             Timer::after(Duration::from_millis(5_000)).await;
             let mut w = writer.lock().await;
             w.write_all(&[0xFF, 0x09, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
         }
     };
 
+    unsafe { shuffle_led().await; }
     join3(key_control, ping_timeout, client_recv(reader, ding, watchdog)).await;
 }
 
@@ -331,6 +336,7 @@ async unsafe fn shuffle_led() {
         } else {
             str.push_str(" $").unwrap();
         }
+        info!("show: {}", str);
         LED.as_mut().unwrap().show(&str).await;
     }
 }
