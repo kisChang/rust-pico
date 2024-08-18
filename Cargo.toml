@@ -13,7 +13,7 @@ embassy-time = { version = "0.3.2", git = "https://github.com/embassy-rs/embassy
 embassy-rp = { version = "0.2.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl"] }
 embassy-usb = { version = "0.3.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
 embassy-net = { version = "0.4.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt", "tcp", "udp", "raw", "dhcpv4", "medium-ethernet", "dns"] }
-embassy-net-wiznet = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
+#embassy-net-wiznet = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
 embassy-futures = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy" }
 embassy-usb-logger = { version = "0.2.0", git = "https://github.com/embassy-rs/embassy" }
 cyw43 = { version = "0.2.0", git = "https://github.com/embassy-rs/embassy", features = ["defmt", "firmware-logs", "bluetooth"] }
@@ -27,7 +27,7 @@ fixed-macro = "1.2"
 # for web request example
 reqwless = { version = "0.12.0", features = ["defmt",]}
 serde = { version = "1.0.203", default-features = false, features = ["derive"] }
-serde-json-core = "0.5.1"
+serde-json-core = "0.6.0"
 
 # for assign resources example
 assign-resources = { git = "https://github.com/adamgreig/assign-resources", rev = "94ad10e2729afdf0fd5a77cd12e68409a982f58a" }
@@ -37,18 +37,18 @@ cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7.0"
 critical-section = "1.1"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
-display-interface-spi = "0.4.1"
-embedded-graphics = "0.7.1"
-st7789 = "0.6.1"
-display-interface = "0.4.1"
+display-interface-spi = "0.5.0"
+embedded-graphics = "0.8.1"
+st7789 = "0.7.0"
+display-interface = "0.5.0"
 byte-slice-cast = { version = "1.2.0", default-features = false }
-smart-leds = "0.3.0"
+smart-leds = "0.4.0"
 heapless = "0.8"
 usbd-hid = "0.8.1"
 
 embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
 embedded-hal-async = "1.0"
-embedded-hal-bus = { version = "0.1", features = ["async"] }
+embedded-hal-bus = { version = "0.2.0", features = ["async"] }
 embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
 embedded-storage = { version = "0.3" }
 static_cell = "2"
@@ -57,7 +57,6 @@ log = "0.4"
 pio-proc = "0.2"
 pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
-embedded-sdmmc = "0.7.0"
 
 bt-hci = { version = "0.1.0", default-features = false, features = ["defmt"] }
 trouble-host = { version = "0.1.0", features = ["defmt", "gatt"] }

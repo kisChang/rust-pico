@@ -15,8 +15,9 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
 use embassy_rp::multicore::spawn_core1;
-use embassy_rp::peripherals::{DMA_CH0, PIO0};
-use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
+use embassy_rp::flash::{Async, ERASE_SIZE, FLASH_BASE};
+use embassy_rp::pio::Pio;
 use embassy_rp::watchdog::Watchdog;
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::channel::{Channel, Sender};
@@ -30,7 +31,11 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+});
+
+bind_interrupts!(struct Irqusb {
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
 });
 
 // 应用配置参数
@@ -41,8 +46,12 @@ const SERVER_ADDR: &str = "10.189.15.230";
 const MY_CLIENT: i32 = 1;
 
 ////// 固定算出的常量
-static mut MY_GROUP: i32 = (MY_CLIENT + 1) / 2;
+static mut MY_GROUP: i32 = 1;
+
 const SERVER_PORT: u16 = 10080;
+// 板内写入信息
+const ADDR_OFFSET: u32 = 0x100000;
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
 // 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
@@ -82,6 +91,17 @@ fn get_firmware_clm() -> &'static [u8] {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    Timer::after_millis(10).await;
+
+    //加载配置信息
+    unsafe {
+        MY_GROUP = (MY_CLIENT + 1) / 2;    
+    }
+    // TODO WebUSB 方式提供配置管理功能
+    // let driver = embassy_rp::usb::Driver::new(p.USB, Irqusb);
+    // TODO flash 的方式存储配置信息
+    // let mut flash = embassy_rp::flash::Flash::<_, Async, FLASH_SIZE>::new(p.FLASH, p.DMA_CH0);
+
 
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
