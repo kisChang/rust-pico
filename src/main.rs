@@ -35,9 +35,9 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
-// bind_interrupts!(struct Irqusb {
-//     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
-// });
+bind_interrupts!(struct Irqusb {
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
+});
 
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
@@ -104,6 +104,7 @@ async fn main(spawner: Spawner) {
     /////初始化控制器
     let ding = Output::new(p.PIN_17, Level::Low);
     // controller
+    let mut work_led = Output::new(p.PIN_2, Level::Low);
     let mut ping = Input::new(p.PIN_14, embassy_rp::gpio::Pull::Up);
     let mut g_up = Input::new(p.PIN_18, embassy_rp::gpio::Pull::Up);
     let mut g_down = Input::new(p.PIN_19, embassy_rp::gpio::Pull::Up);
@@ -153,6 +154,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(net_task(stack)));
 
     control.gpio_set(0, true).await;
+    work_led.set_high();
     led.show(" . . .0").await; //连接WiFi
     loop {
         //control.join_open(WIFI_NETWORK).await;
@@ -281,12 +283,18 @@ async fn main(spawner: Spawner) {
 
     let ping_timeout = async {
         let mut state = false;
+        let mut count = 0;
         loop {
             control.gpio_set(0, state).await;
             state = !state;
-            Timer::after(Duration::from_millis(5_000)).await;
-            let mut w = writer.lock().await;
-            w.write_all(&[0xFF, 0x09, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+            work_led.toggle();
+            Timer::after(Duration::from_millis(1_000)).await;
+            count = count + 1;
+            if count >= 5 { // 5次执行一轮上报
+                count = 0;
+                let mut w = writer.lock().await;
+                w.write_all(&[0xFF, 0x09, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
+            }
         }
     };
 
@@ -326,6 +334,9 @@ async fn client_recv(
     mut watchdog: Watchdog,
     sender: Sender<'_, ThreadModeRawMutex, &str, 64>
 ) {
+    // 先发一次sender,刷新LED
+    sender.send("").await;
+    // 正式进入收报代码
     let mut buf = [0; 256];
     loop {
         match reader.read(&mut buf).await {
