@@ -2,6 +2,9 @@ MEMORY {
     BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
     FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100
 
+    /* Define separate sections for different purposes */
+    APP_DATA : ORIGIN = 0x10180000, LENGTH = 512K
+
     /* Pick one of the two options for RAM layout     */
 
     /* OPTION A: Use all RAM banks as one big block   */

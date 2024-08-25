@@ -11,6 +11,7 @@ use embassy_futures::join::join3;
 use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output};
@@ -34,15 +35,13 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
-bind_interrupts!(struct Irqusb {
-    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
-});
+// bind_interrupts!(struct Irqusb {
+//     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
+// });
 
 // 应用配置参数
 const WIFI_NETWORK: &str = "EXKIDS";
 const WIFI_PASSWORD: &str = "tb-yk-zk!";
-const SERVER_ADDR: &str = "10.189.15.230";
-// const SERVER_ADDR: &str = "10.189.0.11";
 const MY_CLIENT: i32 = 1;
 
 ////// 固定算出的常量
@@ -91,11 +90,10 @@ fn get_firmware_clm() -> &'static [u8] {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    Timer::after_millis(10).await;
 
     //加载配置信息
     unsafe {
-        MY_GROUP = (MY_CLIENT + 1) / 2;    
+        MY_GROUP = (MY_CLIENT + 1) / 2;
     }
     // TODO WebUSB 方式提供配置管理功能
     // let driver = embassy_rp::usb::Driver::new(p.USB, Irqusb);
@@ -176,15 +174,39 @@ async fn main(spawner: Spawner) {
     info!("DHCP IP: {:?}", my_ip.unwrap().address);
 
 
-    led.show(" .0.8.8").await; //尝试接入
+    led.show(" .0.8.8").await; //尝试寻找服务器IP
+    let server_addr: &str;
+    let mut buf_udp = [0; 50];
+    {
+        let mut rx_buffer = [0; 50];
+        let mut tx_buffer = [0; 50];
+        let mut rx_meta = [PacketMetadata::EMPTY; 16];
+        let mut tx_meta = [PacketMetadata::EMPTY; 16];
+
+        let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
+        socket.bind(16667).unwrap();
+        loop {
+            // 给 255.255.255.255:16666 发送消息 telegram
+            socket.send_to("telegram".as_bytes(), (Ipv4Address::from_str("255.255.255.255").unwrap(), 16666)).await.unwrap();
+            // 等待回音
+            let (n, ep) = socket.recv_from(&mut buf_udp).await.unwrap();
+            if let Ok(s) = core::str::from_utf8(&buf_udp[..n]) {
+                info!("Telegram rxd from {}: {}", ep, s);
+                server_addr = s;
+                break;
+            }
+        }
+    }
+
+    led.show("0.8.8.8").await; //尝试接入
     /////
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
     let mut socket: TcpSocket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    info!("try connect...");
+    info!("try connect: {}", server_addr);
     loop {
         let mut err_count = 0;
-        match socket.connect((Ipv4Address::from_str(SERVER_ADDR).unwrap(), SERVER_PORT)).await {
+        match socket.connect((Ipv4Address::from_str(server_addr).unwrap(), SERVER_PORT)).await {
             Err(e) => {
                 warn!("connect error: {:?}", e);
                 err_count += 1;
