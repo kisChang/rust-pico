@@ -7,7 +7,7 @@ use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::join::join3;
+use embassy_futures::join::{join3, join4};
 use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::{TcpReader, TcpSocket};
 use embassy_net::{Config, Ipv4Address, Stack, StackResources};
@@ -24,6 +24,7 @@ use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::channel::{Channel, Sender};
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
+use embedded_hal_1::digital::OutputPin;
 use embedded_io_async::Write;
 use heapless::String;
 use rand::RngCore;
@@ -54,7 +55,8 @@ const FLASH_SIZE: usize = 2 * 1024 * 1024;
 // 初始化状态
 static mut NOW_GROUP: i32 = 1;
 static mut NOW_DING: bool = true;
-static LED_CHANNEL: Channel<ThreadModeRawMutex, &str, 64> = Channel::new();
+static LED_CHANNEL: Channel<ThreadModeRawMutex, &str, 8> = Channel::new();
+static DING_CHANNEL: Channel<ThreadModeRawMutex, u8, 8> = Channel::new();
 
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
@@ -240,13 +242,16 @@ async fn main(spawner: Spawner) {
 
     // 控制器实现
     let key_control = async {
+        let ding_send = DING_CHANNEL.sender();
         loop {
             match select4(key_button(&mut ping), key_button(&mut g_up), key_button(&mut g_down), key_button(&mut g_reset)).await {
                 Either4::First(state) => {
                     let mut w = writer.lock().await;
                     if state {
+                        ding_send.send(1).await;
                         w.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x01, 0x00]).await.expect("send fail");
                     } else {
+                        ding_send.send(0).await;
                         w.write_all(&[0xFF, 0x02, 0x00, 0x01, 0x00, 0x00]).await.expect("send fail");
                     }
                 }
@@ -303,11 +308,14 @@ async fn main(spawner: Spawner) {
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
+            // 刷新LED的任务
             executor1.run(|spawner| unwrap!(spawner.spawn(shuffle_led(led))));
         },
     );
 
-    join3(key_control, ping_timeout, client_recv(reader, ding, watchdog, LED_CHANNEL.sender())).await;
+    join4(key_control, ping_timeout
+          , client_recv(reader, DING_CHANNEL.sender(), watchdog, LED_CHANNEL.sender())
+          , shuffle_ding(ding)).await;
 }
 
 async fn key_button(ping: &mut Input<'_>) -> bool {
@@ -330,12 +338,12 @@ async fn key_button(ping: &mut Input<'_>) -> bool {
 /** 收报代码 */
 async fn client_recv(
     mut reader: TcpReader<'_>,
-    mut ding: Output<'_>,
+    ding_sender: Sender<'_, ThreadModeRawMutex, u8, 8>,
     mut watchdog: Watchdog,
-    sender: Sender<'_, ThreadModeRawMutex, &str, 64>
+    led_sender: Sender<'_, ThreadModeRawMutex, &str, 8>
 ) {
     // 先发一次sender,刷新LED
-    sender.send("").await;
+    led_sender.send("").await;
     // 正式进入收报代码
     let mut buf = [0; 256];
     loop {
@@ -371,20 +379,20 @@ async fn client_recv(
                     match command {
                         1 => unsafe { // 切换分组
                             NOW_GROUP = body[0] as i32;
-                            sender.send("").await;
+                            led_sender.send("").await;
                         }
                         2 => unsafe { // 发报
                             if NOW_DING {
                                 if body[0] == 0 {
-                                    ding.set_low()
+                                    ding_sender.send(0).await;
                                 } else {
-                                    ding.set_high()
+                                    ding_sender.send(1).await;
                                 }
                             }
                         }
                         8 => unsafe { // 工作模式
                             NOW_DING = body[0] == 1;
-                            sender.send("").await;
+                            led_sender.send("").await;
                         }
                         9 => {}
                         _ => {}
@@ -399,6 +407,20 @@ async fn client_recv(
                 break;
             }
         };
+    }
+}
+
+async fn shuffle_ding(mut ding: Output<'static>) {
+    loop {
+        match DING_CHANNEL.receive().await {
+            state => {
+                if state == 0 {
+                    ding.set_low();
+                } else {
+                    ding.set_high();
+                }
+            }
+        }
     }
 }
 
